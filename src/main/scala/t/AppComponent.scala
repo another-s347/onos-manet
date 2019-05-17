@@ -28,20 +28,26 @@ import org.onosproject.net.flow.instructions.{Instruction, Instructions}
 import org.onosproject.net.flowobjective.{DefaultForwardingObjective, FlowObjectiveService, ForwardingObjective}
 import org.onosproject.net.host.HostService
 import org.onosproject.net.packet._
-import org.onosproject.net.topology.{PathService, TopologyEvent, TopologyListener, TopologyService}
+import org.onosproject.net.topology.{LinkWeigher, PathService, TopologyEdge, TopologyEvent, TopologyListener, TopologyService}
 import org.osgi.service.component.annotations.Activate
 import org.apache.felix.scr.annotations.Component
 import org.osgi.service.component.annotations.Deactivate
 import org.slf4j.LoggerFactory
 import org.apache.felix.scr.annotations.Reference
 import org.apache.felix.scr.annotations.ReferenceCardinality
+import org.onlab.graph.{ScalarWeight, Weight}
 import org.onosproject.cfg.ComponentConfigService
 import org.onosproject.net.device.{DeviceEvent, DeviceListener, DeviceService}
 import org.onosproject.net.flow.criteria.{Criterion, EthCriterion, MetadataCriterion}
-import org.onosproject.net.link.LinkEvent
+import org.onosproject.net.link.{DefaultLinkDescription, LinkEvent, LinkListener, LinkProvider, LinkProviderRegistry, LinkProviderService, LinkService, LinkStore}
 import org.osgi.service.component.ComponentContext
 import org.onlab.packet.UDP
+import org.onlab.util.DataRateUnit
+import org.onosproject.net.intent.constraint.{AnnotationConstraint, BandwidthConstraint}
+import org.onosproject.net.intent.{Constraint, HostToHostIntent, Intent, IntentCompiler, IntentExtensionService, IntentService, IntentStore, Key, LinkCollectionIntent, PointToPointIntent}
+import org.onosproject.net.provider.ProviderId
 import org.onosproject.net.statistic.{FlowStatisticService, PortStatisticsService, StatisticService}
+import t.Intent.{Ipv4Constraint, LinkCollectionIntentCompiler}
 
 import scala.collection.{JavaConverters, mutable}
 import scala.collection.JavaConverters._
@@ -49,15 +55,13 @@ import scala.collection.mutable.ListBuffer
 
 
 /**
-  * Skeletal ONOS application component.
-  */
+ * Skeletal ONOS application component.
+ */
 @Component(immediate = true)
 class AppComponent {
     final private val log = LoggerFactory.getLogger(getClass)
     val topologyListener = new MyTopologyListener
     val devicePorcessor = new MyDeviceProcessor
-    val TargetSelectorBuilder = DefaultTrafficSelector.builder()
-    val NoneSelectorBuilder = DefaultTrafficSelector.builder()
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY) var topologyService: TopologyService = _
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY) var cfgService: ComponentConfigService = _
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY) var coreService: CoreService = _
@@ -67,23 +71,47 @@ class AppComponent {
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY) var flowObjectiveService: FlowObjectiveService = _
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY) var deviceService: DeviceService = _
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY) var pathService: PathService = _
-    @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY) var portStatService: StatisticService = _
+    @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY) var statService: StatisticService = _
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY) var flowStatService: FlowStatisticService = _
+    @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY) var intentExtension: IntentExtensionService = _
+    @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY) var intentService: IntentService = _
+    @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY) var linkService: LinkService = _
+    @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY) var linkStore: LinkStore = _
+    @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY) var linkProviderRegistry: LinkProviderRegistry = _
+    @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY) var intentStore: IntentStore = _
     var appId: ApplicationId = _
     var packetProcessor = new MyPacketProcessor
     var devices: Set[DeviceId] = Set.empty
     var task: Option[PortStatsTask] = None
     var targetStatus: Map[DeviceId, PortStatus] = Map.empty
+    var old_compiler: Option[IntentCompiler[LinkCollectionIntent]] = None
+    var intents: java.util.concurrent.ConcurrentHashMap[Key, MonitorStatus] = new java.util.concurrent.ConcurrentHashMap()
+    var linkRates: mutable.HashMap[Link, Long] = mutable.HashMap.empty
+    val timer = new Timer()
+    val linkWeigher = new MyLinkWeigher
 
     @Activate def activate(context: ComponentContext): Unit = {
-        cfgService.registerProperties(getClass)
+        //cfgService.registerProperties(getClass)
         appId = coreService.registerApplication("test scala")
         packetService.addProcessor(packetProcessor, PacketProcessor.director(2))
-        topologyService.addListener(topologyListener)
+        //        topologyService.addListener(topologyListener)
         requestIntercepts()
+//        linkService.addListener(event => {
+//            log.info(f"link event == $event")
+//        })
+        intentService.getIntents.forEach(intent=>{
+            if(intent.appId()==appId) {
+                intentService.withdraw(intent)
+                intentService.purge(intent)
+            }
+        })
         task = Some(new PortStatsTask)
         task.get.schedule()
         log.info("scala Started")
+        val compilpers = intentExtension.getCompilers.asScala
+        old_compiler = compilpers.get(classOf[LinkCollectionIntent]).asInstanceOf[Option[IntentCompiler[LinkCollectionIntent]]]
+        intentExtension.unregisterCompiler(classOf[LinkCollectionIntent])
+        intentExtension.registerCompiler(classOf[LinkCollectionIntent], new LinkCollectionIntentCompiler(hostService, appId))
     }
 
     def requestIntercepts(): Unit = {
@@ -93,13 +121,20 @@ class AppComponent {
     }
 
     @Deactivate def deactivate(): Unit = {
-        cfgService.unregisterProperties(getClass, false)
+        //cfgService.unregisterProperties(getClass, false)
         withdrawIntercepts()
+        linkProviderRegistry.unregister(this)
+        intents.forEach((_, m)=>{
+            intentService.withdraw(m.intent)
+            intentService.purge(m.intent)
+        })
         flowRuleService.removeFlowRulesById(appId)
         packetService.removeProcessor(packetProcessor)
-        topologyService.removeListener(topologyListener)
+        //        topologyService.removeListener(topologyListener)
         packetProcessor = null
-        task.get.getTimer().cancel()
+        task.get.cancel()
+        intentExtension.unregisterCompiler(classOf[LinkCollectionIntent])
+        intentExtension.registerCompiler(classOf[LinkCollectionIntent], old_compiler.get)
         log.info("Stopped")
     }
 
@@ -327,6 +362,17 @@ class AppComponent {
             val hosts = hostService.getHostsByIp(srcIp)
             val srcHost = hosts.iterator().next()
 
+            val constraints = List[Constraint](
+                BandwidthConstraint of(30, DataRateUnit.MBPS),
+                Ipv4Constraint.of(srcHost.id(), srcIp),
+                Ipv4Constraint.of(dstHost.id(), dstIp),
+                //                    new AnnotationConstraint("custom",2.00)
+            ).asJava
+
+            setConnectivity(srcHost, dstHost, srcIp, dstIp, constraints, target = false)
+            context.
+            return
+
             val dstDeviceId = dstHost.location().deviceId()
             val srcDeviceId = srcHost.location().deviceId()
             val curDeviceId = inPacket.receivedFrom().deviceId()
@@ -426,6 +472,34 @@ class AppComponent {
                         // for ethernet test:
                         installInRule(srcIp, srcMac, dstIp, curMac, inPort, curDeviceId, curMac, toMacAddress(nexthop._1))
                 }
+            }
+        }
+
+        def setConnectivity(srcHost: Host, dstHost: Host, srcIp: Ip4Address, dstIp: Ip4Address, constraints: util.List[Constraint], target:Boolean): Unit = {
+            val key = Key.of(f"${srcHost.id()},${dstHost.id()},$target", appId)
+            if (intents.contains(key)) {
+                return
+            }
+            else {
+                val path = pathService.getPaths(srcHost.id(), dstHost.id()).iterator().next()
+                if (path == null) {
+                    log.info(f"no path found")
+                    return
+                }
+                val firstLink = path.links().get(0)
+                val lastLink = path.links().get(path.links().size() - 1)
+                val intentBuilder = PointToPointIntent.builder()
+                    .filteredIngressPoint(new FilteredConnectPoint(firstLink.dst()))
+                    .filteredEgressPoint(new FilteredConnectPoint(lastLink.src()))
+                    .constraints(constraints)
+                    .priority(15)
+                    .appId(appId)
+                    .key(key)
+                    .suggestedPath(path.links().subList(1, path.links().size() - 2))
+                val intent = intentBuilder.build()
+                intents.put(key, MonitorStatus(path, intent, src = srcHost, dst = dstHost, intentBuilder, target))
+                //intents.put(key, MonitorStatus(path, intent, src = srcHost, dst = dstHost, intentBuilder))
+                intentService.submit(intent)
             }
         }
 
@@ -623,7 +697,7 @@ class AppComponent {
                             pathTables += tableId
                             tableId += 1
                         })
-                        targetStatus += (context.inPacket().receivedFrom().deviceId() -> PortStatus(3, s._2,pathTables.toList, 3))
+                        targetStatus += (context.inPacket().receivedFrom().deviceId() -> PortStatus(3, s._2, pathTables.toList, 3))
                     }
                     case Nil => {
                         log.info("find none hop")
@@ -637,7 +711,7 @@ class AppComponent {
                 val srcMac = ethPacket.getSourceMAC
                 val curTableId = if (targetStatus.contains(inPacket.receivedFrom().deviceId())) {
                     val cur = targetStatus(inPacket.receivedFrom().deviceId()).currentTableId
-                    log.info("current table id == {}",cur)
+                    log.info("current table id == {}", cur)
                     cur
                 }
                 else {
@@ -778,22 +852,22 @@ class AppComponent {
         log.info(f"old_status == $old_tableId")
         val old_punt: Option[FlowEntry] = flowRuleService.getFlowEntries(deviceId).iterator().asScala
             .filter(_.appId() == appId.id())
-            .filter(_.table().compareTo(IndexTableId.of(old_tableId))==0)
-                .find(_.treatment().allInstructions().asScala.exists(
-                    (p: Instruction) => {
-                        if(p.`type`()==Instruction.Type.OUTPUT) {
-                            p.asInstanceOf[Instructions.OutputInstruction].port().exactlyEquals(PortNumber.CONTROLLER)
-                        }
-                        else {
-                            false
-                        }
+            .filter(_.table().compareTo(IndexTableId.of(old_tableId)) == 0)
+            .find(_.treatment().allInstructions().asScala.exists(
+                (p: Instruction) => {
+                    if (p.`type`() == Instruction.Type.OUTPUT) {
+                        p.asInstanceOf[Instructions.OutputInstruction].port().exactlyEquals(PortNumber.CONTROLLER)
                     }
-                ))
+                    else {
+                        false
+                    }
+                }
+            ))
         flowRuleService.getFlowEntries(deviceId).iterator().asScala
             .filter(_.appId() == appId.id())
-            .foreach(p=>{
+            .foreach(p => {
                 val is_del = p.treatment().tableTransition()
-                if(is_del!=null){
+                if (is_del != null) {
                     val selectorBuilder = DefaultTrafficSelector.builder()
                     selectorBuilder
                         .matchEthType(Ethernet.TYPE_IPV4)
@@ -820,12 +894,12 @@ class AppComponent {
                         .forTable(tableId)
                         .forDevice(deviceId)
                         .build())
-                    old_punt.foreach(old=>{
+                    old_punt.foreach(old => {
                         flowRuleService.removeFlowRules(old)
                     })
                     val old = targetStatus(deviceId)
-                    old.currentTableId=tableId
-                    targetStatus+=(deviceId->old)
+                    old.currentTableId = tableId
+                    targetStatus += (deviceId -> old)
                 }
             })
     }
@@ -844,9 +918,9 @@ class AppComponent {
         }
     }
 
-    def getMasterPathTableStats(deviceId:DeviceId): Long = {
+    def getMasterPathTableStats(deviceId: DeviceId): Long = {
         val masterPort = targetStatus(deviceId).MasterPathPort
-        flowStatService.loadSummary(deviceService.getDevice(deviceId),masterPort).totalLoad().rate()
+        flowStatService.loadSummary(deviceService.getDevice(deviceId), masterPort).totalLoad().rate()
     }
 
     class MyDeviceProcessor {
@@ -890,41 +964,92 @@ class AppComponent {
         }
     }
 
-    case class PortStatus(MasterPathTableId: Int, MasterPathPort:PortNumber, PathTableIds: List[Int], var currentTableId: Int)
+    case class PortStatus(MasterPathTableId: Int, MasterPathPort: PortNumber, PathTableIds: List[Int], var currentTableId: Int)
+
+    case class MonitorStatus(path: Path, intent: Intent, src: Host, dst: Host, intentBuilder: PointToPointIntent.Builder, target:Boolean)
+
+    class MyLinkWeigher extends LinkWeigher {
+        override def weight(edge: TopologyEdge): Weight = {
+            if(linkRates.contains(edge.link())) {
+                new ScalarWeight(linkRates(edge.link()))
+            }
+            else {
+                new ScalarWeight(1)
+            }
+        }
+
+        override def getInitialWeight: Weight = {
+            new ScalarWeight(1)
+        }
+
+        override def getNonViableWeight: Weight = {
+            new ScalarWeight(1)
+        }
+    }
 
     class PortStatsTask {
-        val timer = new Timer()
         private var exit: Boolean = false
 
         def schedule() = {
-            timer.schedule(new Task(), 2000, 2000)
-        }
-
-        def getTimer(): Timer = {
-            timer
+            timer.scheduleAtFixedRate(new Task(), 0, 1000)
         }
 
         def isExit(): Boolean = {
             exit
         }
 
+        def cancel(): Unit = {
+            exit = true
+            timer.cancel()
+        }
+
         class Task extends TimerTask {
             override def run(): Unit = {
-                targetStatus.foreach(what => {
-                    val deviceId = what._1
-                    val status = what._2
-                    val rate = getMasterPathTableStats(deviceId)
-                    val info = f"connect point $deviceId rate == $rate"
-                    log.info(info)
-                    if (rate > 1000 && status.currentTableId == status.MasterPathTableId) {
-                        log.info(f"switching...-- $deviceId")
-                        val tableId = selectSecondaryTargetJump(deviceId)
-                        setTargetTableJump(deviceId, tableId)
+                linkService.getLinks().forEach(link => {
+                    linkRates.put(link, statService.load(link).rate())
+                })
+                intents.forEach((key,m)=>{
+                    val newPathIter = pathService.getPaths(m.src.id(),m.dst.id(),linkWeigher).iterator()
+                    if(newPathIter.hasNext){
+                        val path = newPathIter.next()
+                        if(!path.equals(m.path)) {
+                            log.info(f"switch...")
+                            log.info(f"path == $path")
+                        }
                     }
                 })
+                //                intents.forEach((key,m)=>{
+                //                    log.info(f"checking...$key")
+                //                    val builder: PointToPointIntent.Builder = m.intentBuilder
+                //                    val newPathIter = pathService.getKShortestPaths(m.src.id(), m.dst.id()).iterator()
+                //                    newPathIter.next()
+                //                    if(newPathIter.hasNext) {
+                //                        val path = newPathIter.next()
+                //                        if(!path.equals(m.path)) {
+                //                            log.info(f"switch...")
+                //                            log.info(f"path == $path")
+                //                            builder.suggestedPath(path.links().subList(1, path.links().size() - 1))
+                //                            val intent = builder.build()
+                //                            intents.replace(key,MonitorStatus(path, intent, src = m.src, dst = m.dst, m.intentBuilder))
+                //                            intentService.submit(intent)
+                //                        }
+                //                    }
+                //                })
             }
+
+            //                targetStatus.foreach(what => {
+            //                    val deviceId = what._1
+            //                    val status = what._2
+            //                    val rate = getMasterPathTableStats(deviceId)
+            //                    val info = f"connect point $deviceId rate == $rate"
+            //                    log.info(info)
+            //                    if (rate > 1000 && status.currentTableId == status.MasterPathTableId) {
+            //                        log.info(f"switching...-- $deviceId")
+            //                        val tableId = selectSecondaryTargetJump(deviceId)
+            //                        setTargetTableJump(deviceId, tableId)
+            //                    }
+            //                })
         }
 
     }
-
 }
