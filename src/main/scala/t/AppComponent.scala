@@ -15,6 +15,7 @@
  */
 package t
 
+import java.nio.ByteBuffer
 import java.util
 import java.util.{Optional, Timer, TimerTask}
 
@@ -222,20 +223,42 @@ class AppComponent {
                 //                    new AnnotationConstraint("custom",2.00)
             ).asJava
 
-            setConnectivity(srcHost, dstHost, srcIp, dstIp, constraints, target = false)
+            val path = setConnectivity(srcHost, dstHost, constraints, target = false)
+            if(path.isDefined&&true) {
+                val curDevice = inPacket.receivedFrom().deviceId()
+                val packet = inPacket.parsed()
+                findNextHop(curDevice, path.get).foreach(p=>{
+                    p.dst().elementId() match {
+                        case _:HostId=>
+                            packet.setSourceMACAddress(srcHost.mac())
+                            packet.setDestinationMACAddress(dstHost.mac())
+                            val treatment = DefaultTrafficTreatment.builder()
+                                    .setOutput(p.src().port())
+                                    .build()
+                            packetService.emit(new DefaultOutboundPacket(curDevice, treatment, ByteBuffer.wrap(packet.serialize())))
+                        case deviceId:DeviceId=>
+                            packet.setSourceMACAddress(toMacAddress(curDevice))
+                            packet.setDestinationMACAddress(toMacAddress(deviceId))
+                            val treatment = DefaultTrafficTreatment.builder()
+                                .setOutput(p.src().port())
+                                .build()
+                            packetService.emit(new DefaultOutboundPacket(curDevice, treatment, ByteBuffer.wrap(packet.serialize())))
+                    }
+                })
+            }
         }
 
-        def setConnectivity(srcHost: Host, dstHost: Host, srcIp: Ip4Address, dstIp: Ip4Address, constraints: util.List[Constraint], target: Boolean): Unit = {
+        def setConnectivity(srcHost: Host, dstHost: Host, constraints: util.List[Constraint], target: Boolean): Option[Path] = {
             val id = if(target) targetAppId else appId
             val key = Key.of(f"${srcHost.id()},${dstHost.id()},$target", id)
             if (intents.contains(key)) {
-                return
+                None
             }
             else {
                 val path = pathService.getPaths(srcHost.id(), dstHost.id()).iterator().next()
                 if (path == null) {
                     log.info(f"no path found")
-                    return
+                    return None
                 }
                 val firstLink = path.links().get(0)
                 val lastLink = path.links().get(path.links().size() - 1)
@@ -251,7 +274,17 @@ class AppComponent {
                 intents.put(key, MonitorStatus(path, intent, src = srcHost, dst = dstHost, intentBuilder, target))
                 //intents.put(key, MonitorStatus(path, intent, src = srcHost, dst = dstHost, intentBuilder))
                 intentService.submit(intent)
+                Some(path)
             }
+        }
+
+        def findNextHop(curDevice:DeviceId, path: Path): Option[Link] = {
+            path.links().forEach(link=>{
+                if(link.src().elementId()==curDevice) {
+                    return Some(link)
+                }
+            })
+            None
         }
 
         def flood(context: PacketContext): Unit = {
@@ -295,7 +328,29 @@ class AppComponent {
                 //                    new AnnotationConstraint("custom",2.00)
             ).asJava
 
-            setConnectivity(srcHost, dstHost, srcIp, dstIp, constraints, target = true)
+            val path=setConnectivity(srcHost, dstHost, constraints, target = true)
+            if(path.isDefined&&true) {
+                val curDevice = inPacket.receivedFrom().deviceId()
+                val packet = inPacket.parsed()
+                findNextHop(curDevice, path.get).foreach(p=>{
+                    p.dst().elementId() match {
+                        case _:HostId=>
+                            packet.setSourceMACAddress(srcHost.mac())
+                            packet.setDestinationMACAddress(dstHost.mac())
+                            val treatment = DefaultTrafficTreatment.builder()
+                                .setOutput(p.src().port())
+                                .build()
+                            packetService.emit(new DefaultOutboundPacket(curDevice, treatment, ByteBuffer.wrap(packet.serialize())))
+                        case deviceId:DeviceId=>
+                            packet.setSourceMACAddress(toMacAddress(curDevice))
+                            packet.setDestinationMACAddress(toMacAddress(deviceId))
+                            val treatment = DefaultTrafficTreatment.builder()
+                                .setOutput(p.src().port())
+                                .build()
+                            packetService.emit(new DefaultOutboundPacket(curDevice, treatment, ByteBuffer.wrap(packet.serialize())))
+                    }
+                })
+            }
         }
 
         def isControlPacket(ethPkt: Ethernet): Boolean = {
@@ -387,11 +442,11 @@ class AppComponent {
     class PortStatsTask {
         private var exit: Boolean = false
 
-        def schedule() = {
+        def schedule(): Unit = {
             timer.scheduleAtFixedRate(new Task(), 0, 1000)
         }
 
-        def isExit(): Boolean = {
+        def isExit: Boolean = {
             exit
         }
 
