@@ -31,7 +31,7 @@ import org.onosproject.net.flow._
 import org.onosproject.net.flowobjective.FlowObjectiveService
 import org.onosproject.net.host.HostService
 import org.onosproject.net.intent.constraint.BandwidthConstraint
-import org.onosproject.net.intent.{Constraint, Intent, IntentCompiler, IntentExtensionService, IntentService, IntentStore, Key, LinkCollectionIntent, PointToPointIntent}
+import org.onosproject.net.intent.{Constraint, HostToHostIntent, Intent, IntentCompiler, IntentExtensionService, IntentService, IntentStore, Key, LinkCollectionIntent, PointToPointIntent}
 import org.onosproject.net.link.{LinkProviderRegistry, LinkService, LinkStore}
 import org.onosproject.net.packet._
 import org.onosproject.net.statistic.{FlowStatisticService, StatisticService}
@@ -262,19 +262,33 @@ class AppComponent {
                 }
                 val firstLink = path.links().get(0)
                 val lastLink = path.links().get(path.links().size() - 1)
-                val intentBuilder = PointToPointIntent.builder()
-                    .filteredIngressPoint(new FilteredConnectPoint(firstLink.dst()))
-                    .filteredEgressPoint(new FilteredConnectPoint(lastLink.src()))
-                    .constraints(constraints)
-                    .priority(15)
-                    .appId(id)
-                    .key(key)
-                    .suggestedPath(path.links().subList(1, path.links().size() - 2))
-                val intent = intentBuilder.build()
-                intents.put(key, MonitorStatus(path, intent, src = srcHost, dst = dstHost, intentBuilder, target))
-                //intents.put(key, MonitorStatus(path, intent, src = srcHost, dst = dstHost, intentBuilder))
-                intentService.submit(intent)
-                Some(path)
+                if(path.links().size()==2) {
+                    val intentBuilder = HostToHostIntent.builder()
+                            .appId(id)
+                            .key(key)
+                            .constraints(constraints)
+                            .priority(15)
+                            .one(srcHost.id())
+                            .two(dstHost.id())
+                    val intent = intentBuilder.build()
+                    intentService.submit(intent)
+                    Some(path)
+                }
+                else {
+                    val intentBuilder = PointToPointIntent.builder()
+                        .filteredIngressPoint(new FilteredConnectPoint(firstLink.dst()))
+                        .filteredEgressPoint(new FilteredConnectPoint(lastLink.src()))
+                        .constraints(constraints)
+                        .priority(15)
+                        .appId(id)
+                        .key(key)
+                        .suggestedPath(path.links().subList(1, path.links().size() - 2))
+                    val intent = intentBuilder.build()
+                    intents.put(key, MonitorStatus(path, intent, src = srcHost, dst = dstHost, intentBuilder, target))
+                    //intents.put(key, MonitorStatus(path, intent, src = srcHost, dst = dstHost, intentBuilder))
+                    intentService.submit(intent)
+                    Some(path)
+                }
             }
         }
 

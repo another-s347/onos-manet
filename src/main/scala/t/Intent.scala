@@ -72,6 +72,9 @@ object Intent {
             }
             val dstHost = dstHosts.iterator().next()
             val nodes = scala.collection.mutable.HashMap.empty[DeviceId, Node]
+            if(intent.links().size()==0) {
+                nodes.put(src.deviceId(),LocalNode(src.deviceId(),src.port(),dst.port()))
+            }
             intent.links().forEach(link => {
                 log.info(f"link == $link")
                 // src* --> ???
@@ -216,8 +219,28 @@ object Intent {
                         .fromApp(appId)
                         .makeTemporary(2000)
                         .build()
-                case LocalNode() =>
-                    ???
+                case LocalNode(cur, inPort, outPort) =>
+                    val selector = DefaultTrafficSelector.builder(intent.selector())
+                    selector.matchEthSrc(srcHost.mac())
+                        .matchEthDst(dstHost.mac())
+                        .matchEthType(Ethernet.TYPE_IPV4)
+                    if (srcIp.isDefined) {
+                        selector.matchIPSrc(Ip4Prefix.valueOf(srcIp.get, Ip4Prefix.MAX_MASK_LENGTH))
+                    }
+                    if (dstIp.isDefined) {
+                        selector.matchIPDst(Ip4Prefix.valueOf(dstIp.get, Ip4Prefix.MAX_MASK_LENGTH))
+                    }
+                    val treatment = DefaultTrafficTreatment.builder(intent.treatment())
+                    treatment.setOutput(outPort)
+                    DefaultFlowRule.builder
+                        .forDevice(cur)
+                        .forTable(tableId)
+                        .withSelector(selector.build())
+                        .withTreatment(treatment.build())
+                        .withPriority(intent.priority)
+                        .fromApp(appId)
+                        .makeTemporary(2000)
+                        .build()
             }
         }
 
@@ -238,6 +261,6 @@ object Intent {
 
     case class DstNode(cur: DeviceId, inPort: PortNumber, outPort: PortNumber, prev: DeviceId) extends Node
 
-    case class LocalNode() extends Node
+    case class LocalNode(cur: DeviceId, inPort: PortNumber, outPort: PortNumber) extends Node
 
 }
