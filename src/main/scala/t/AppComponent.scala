@@ -77,8 +77,10 @@ class AppComponent {
     var old_compiler: Option[IntentCompiler[LinkCollectionIntent]] = None
     var intents: java.util.concurrent.ConcurrentHashMap[Key, MonitorStatus] = new java.util.concurrent.ConcurrentHashMap()
     var linkRates: mutable.HashMap[Link, Long] = mutable.HashMap.empty
+    var deviceRates: mutable.HashMap[DeviceId, Long] = mutable.HashMap.empty
     val timer = new Timer()
     val linkWeigher = new MyLinkWeigher
+    val emptyWeigher = new EmptyLinkWeigher
 
     @Activate def activate(context: ComponentContext): Unit = {
         //cfgService.registerProperties(getClass)
@@ -118,8 +120,6 @@ class AppComponent {
             intentService.withdraw(m.intent)
             intentService.purge(m.intent)
         })
-        flowRuleService.removeFlowRulesById(appId)
-        flowRuleService.removeFlowRulesById(targetAppId)
         packetService.removeProcessor(packetProcessor)
         packetProcessor = null
         task.get.cancel()
@@ -255,7 +255,8 @@ class AppComponent {
                 None
             }
             else {
-                val path = pathService.getPaths(srcHost.id(), dstHost.id()).iterator().next()
+                val weigher = if(target) linkWeigher else emptyWeigher
+                val path = pathService.getPaths(srcHost.id(), dstHost.id(),weigher).iterator().next()
                 if (path == null) {
                     log.info(f"no path found")
                     return None
@@ -282,7 +283,7 @@ class AppComponent {
                         .priority(15)
                         .appId(id)
                         .key(key)
-                        .suggestedPath(path.links().subList(1, path.links().size() - 2))
+                        .suggestedPath(path.links().subList(1, path.links().size() - 1))
                     val intent = intentBuilder.build()
                     intents.put(key, MonitorStatus(path, intent, src = srcHost, dst = dstHost, intentBuilder, target))
                     //intents.put(key, MonitorStatus(path, intent, src = srcHost, dst = dstHost, intentBuilder))
@@ -404,7 +405,7 @@ class AppComponent {
                     .withSelector(selectorBuilder.build())
                     .withTreatment(treatment)
                     .withPriority(8000)
-                    .fromApp(appId)
+                    .fromApp(targetAppId)
                     .makeTemporary(2000)
                     .forTable(0)
                     .forDevice(deviceId)
@@ -417,7 +418,7 @@ class AppComponent {
                     .withSelector(selectorBuilder.build())
                     .withTreatment(gotoControllor)
                     .withPriority(0)
-                    .fromApp(appId)
+                    .fromApp(targetAppId)
                     .makeTemporary(2000)
                     .forTable(3)
                     .forDevice(deviceId)
@@ -431,17 +432,40 @@ class AppComponent {
 
     class MyLinkWeigher extends LinkWeigher {
         override def weight(edge: TopologyEdge): Weight = {
-            if (linkRates.contains(edge.link())) {
-                if(linkRates(edge.link())>1000){
-                    new ScalarWeight(linkRates(edge.link()))
-                }
-                else {
-                    new ScalarWeight(1)
+            var rate:Long = 1
+            if(edge.link().src().elementId().isInstanceOf[DeviceId]) {
+                val srcId = edge.link().src().deviceId()
+                if(deviceRates.contains(srcId)) {
+                    if(deviceRates(srcId)>0){
+                        log.info(f"weigher device == ${srcId}")
+                    }
+                    rate += deviceRates(srcId)
                 }
             }
-            else {
-                new ScalarWeight(1)
+            if(edge.link().dst().elementId().isInstanceOf[DeviceId]) {
+                val dstId = edge.link().dst().deviceId()
+                if(deviceRates.contains(dstId)) {
+                    if(deviceRates(dstId)>0){
+                        log.info(f"weigher device == ${dstId}")
+                    }
+                    rate += deviceRates(dstId)
+                }
             }
+            new ScalarWeight(rate)
+        }
+
+        override def getInitialWeight: Weight = {
+            new ScalarWeight(1)
+        }
+
+        override def getNonViableWeight: Weight = {
+            new ScalarWeight(1)
+        }
+    }
+
+    class EmptyLinkWeigher extends LinkWeigher {
+        override def weight(edge: TopologyEdge): Weight = {
+            new ScalarWeight(1)
         }
 
         override def getInitialWeight: Weight = {
@@ -471,19 +495,35 @@ class AppComponent {
 
         class Task extends TimerTask {
             override def run(): Unit = {
-                linkService.getLinks().forEach(link => {
-                    val rate = statService.load(link, appId, Optional.empty()).rate()
-                    linkRates.put(link, rate)
+//                deviceService.getDevices.forEach(device=>{
+//                    val load = flowStatService.loadSummary(device,PortNumber.IN_PORT)
+//                    val rate = load.totalLoad().rate()
+//                    log.info(f"device ${device.id()}, rate == $rate")
+//                    deviceRates.put(device.id(),load.totalLoad().rate())
+//                })
+                deviceService.getDevices.forEach(device=>{
+                    val load = flowStatService.loadSummary(device,PortNumber.IN_PORT)
+//                    log.info("port number == in_port")
+                    val rate = load.unknownLoad().rate()
+//                    if(rate!=0) {
+//                        log.info(f"device == ${device.id()}, totalLoad == ${load.totalLoad()}, unknownLoad == ${load.unknownLoad()}")
+//                    }
+                    deviceRates.put(device.id(),rate)
                 })
                 intents.forEach((key, m) => {
                     val newPathIter = if (m.target) {
-                        pathService.getPaths(m.src.id(), m.dst.id(), linkWeigher).iterator()
+                        pathService.getPaths(m.src.id(), m.dst.id(), linkWeigher).iterator().asScala.toList
                     }
                     else {
-                        pathService.getPaths(m.src.id(), m.dst.id()).iterator()
+                        pathService.getPaths(m.src.id(), m.dst.id(), emptyWeigher).iterator().asScala.toList
                     }
-                    if (newPathIter.hasNext) {
-                        val path = newPathIter.next()
+                    if (newPathIter.nonEmpty) {
+                        val path = newPathIter.head
+                        if(m.target) {
+                            for(link <- newPathIter) {
+                                log.info(f"link cost == ${link.weight()}, old == ${link.equals(m.path)}")
+                            }
+                        }
                         if (!path.equals(m.path)) {
                             log.info(f"switch...")
                             log.info(f"path == $path")

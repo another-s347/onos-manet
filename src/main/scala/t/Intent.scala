@@ -2,22 +2,16 @@ package t
 
 import java.util
 
-import com.google.common.collect.{HashMultimap, ImmutableList, ImmutableMap}
+import com.google.common.collect.ImmutableList
 import org.onlab.packet.{Ethernet, Ip4Address, Ip4Prefix, MacAddress}
-import org.onosproject.core.{ApplicationId, CoreService}
-import org.onosproject.net.{ConnectPoint, DeviceId, Host, HostId, Link, Path, PortNumber}
-import org.onosproject.net.domain.DomainId.LOCAL
-import org.onosproject.net.domain.DomainService
-import org.onosproject.net.flow.{DefaultFlowRule, DefaultTrafficSelector, DefaultTrafficTreatment, FlowRule, TableId}
+import org.onosproject.core.ApplicationId
+import org.onosproject.net.flow.{DefaultFlowRule, DefaultTrafficSelector, DefaultTrafficTreatment, FlowRule}
 import org.onosproject.net.host.HostService
 import org.onosproject.net.intent.{Constraint, FlowRuleIntent, Intent, IntentCompiler, LinkCollectionIntent, PathIntent, ResourceContext}
-import org.onosproject.net.resource.ResourceService
-import org.osgi.service.component.annotations._
+import org.onosproject.net._
 import org.slf4j.LoggerFactory
 
 import scala.collection.JavaConverters._
-import scala.collection.mutable
-import scala.collection.mutable.ListBuffer
 
 object Intent {
 
