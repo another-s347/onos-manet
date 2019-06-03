@@ -165,10 +165,15 @@ class AppComponent {
             }
 
             if (ethPacket.getDestinationMAC.isBroadcast) {
-                if (topologyService.isBroadcastPoint(topologyService.currentTopology(), context.inPacket().receivedFrom())) {
-                    packetOut(context, PortNumber.FLOOD)
-                    return
-                }
+                hostService.getHosts.forEach(host=>{
+                    val location = host.location()
+                    packetOut(context, location)
+                })
+                return
+//                if (topologyService.isBroadcastPoint(topologyService.currentTopology(), context.inPacket().receivedFrom())) {
+//                    packetOut(context, PortNumber.FLOOD)
+//                    return
+//                }
             }
 
             if (ethPacket.getEtherType != Ethernet.TYPE_IPV4) {
@@ -313,6 +318,13 @@ class AppComponent {
             }
         }
 
+        def packetOut(context: PacketContext, connectPoint: ConnectPoint): Unit ={
+            val device = connectPoint.deviceId()
+            val treatment = DefaultTrafficTreatment.builder().setOutput(connectPoint.port()).build()
+            val packet = new DefaultOutboundPacket(device,treatment,context.inPacket().unparsed())
+            packetService.emit(packet)
+        }
+
         def packetOut(context: PacketContext, number: PortNumber): Unit = {
             context.treatmentBuilder().setOutput(number)
             context.send()
@@ -394,6 +406,7 @@ class AppComponent {
 
             }
             else {
+                // target jump
                 val selectorBuilder = DefaultTrafficSelector.builder()
                 selectorBuilder
                     .matchEthType(Ethernet.TYPE_IPV4)
@@ -410,7 +423,7 @@ class AppComponent {
                     .forTable(0)
                     .forDevice(deviceId)
                 flowRuleService.applyFlowRules(flowRule.build())
-                //
+                // fallback to controller
                 val gotoControllor = DefaultTrafficTreatment.builder()
                     .punt()
                     .build()
@@ -421,6 +434,19 @@ class AppComponent {
                     .fromApp(targetAppId)
                     .makeTemporary(2000)
                     .forTable(3)
+                    .forDevice(deviceId)
+                    .build())
+                // broadcast intercept
+                val broadcastSelector = DefaultTrafficSelector.builder()
+                    .matchEthType(Ethernet.TYPE_IPV4)
+                    .matchEthDst(MacAddress.BROADCAST)
+                flowRuleService.applyFlowRules(DefaultFlowRule.builder()
+                    .withSelector(broadcastSelector.build())
+                    .withTreatment(gotoControllor)
+                    .withPriority(8001)
+                    .fromApp(appId)
+                    .makeTemporary(2000)
+                    .forTable(0)
                     .forDevice(deviceId)
                     .build())
                 devices += deviceId
@@ -520,9 +546,9 @@ class AppComponent {
                     if (newPathIter.nonEmpty) {
                         val path = newPathIter.head
                         if(m.target) {
-                            for(link <- newPathIter) {
-                                log.info(f"link cost == ${link.weight()}, old == ${link.equals(m.path)}")
-                            }
+//                            for(link <- newPathIter) {
+//                                log.info(f"link cost == ${link.weight()}, old == ${link.equals(m.path)}")
+//                            }
                         }
                         if (!path.equals(m.path)) {
                             log.info(f"switch...")
